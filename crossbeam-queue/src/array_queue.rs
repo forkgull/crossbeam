@@ -4,12 +4,12 @@
 //!   - <http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue>
 
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
 use core::fmt;
 use core::mem::{self, MaybeUninit};
 use core::panic::{RefUnwindSafe, UnwindSafe};
-use core::sync::atomic::{self, AtomicUsize, Ordering};
 
+use crate::primitive::cell::UnsafeCell;
+use crate::primitive::sync::atomic::{self, AtomicUsize, Ordering};
 use crossbeam_utils::{Backoff, CachePadded};
 
 /// A slot in a queue.
@@ -160,9 +160,9 @@ impl<T> ArrayQueue<T> {
                 ) {
                     Ok(_) => {
                         // Write the value into the slot and update the stamp.
-                        unsafe {
-                            slot.value.get().write(MaybeUninit::new(value));
-                        }
+                        slot.value.with_mut(|value_slot| unsafe {
+                            value_slot.write(MaybeUninit::new(value));
+                        });
                         slot.stamp.store(tail + 1, Ordering::Release);
                         return Ok(());
                     }
@@ -244,7 +244,9 @@ impl<T> ArrayQueue<T> {
                 self.tail.store(new_tail, Ordering::SeqCst);
 
                 // Swap the previous value.
-                let old = unsafe { slot.value.get().replace(MaybeUninit::new(v)).assume_init() };
+                let old = slot
+                    .value
+                    .with_mut(|value| unsafe { value.replace(MaybeUninit::new(v)).assume_init() });
 
                 // Update the stamp.
                 slot.stamp.store(tail + 1, Ordering::Release);
@@ -307,7 +309,9 @@ impl<T> ArrayQueue<T> {
                 ) {
                     Ok(_) => {
                         // Read the value from the slot and update the stamp.
-                        let msg = unsafe { slot.value.get().read().assume_init() };
+                        let msg = slot
+                            .value
+                            .with_mut(|value| unsafe { value.read().assume_init() });
                         slot.stamp
                             .store(head.wrapping_add(self.one_lap), Ordering::Release);
                         return Some(msg);
@@ -446,8 +450,8 @@ impl<T> Drop for ArrayQueue<T> {
     fn drop(&mut self) {
         if mem::needs_drop::<T>() {
             // Get the index of the head.
-            let head = *self.head.get_mut();
-            let tail = *self.tail.get_mut();
+            let head = self.head.with_mut(|&mut head| head);
+            let tail = self.tail.with_mut(|&mut tail| tail);
 
             let hix = head & (self.one_lap - 1);
             let tix = tail & (self.one_lap - 1);
@@ -474,7 +478,7 @@ impl<T> Drop for ArrayQueue<T> {
                 unsafe {
                     debug_assert!(index < self.buffer.len());
                     let slot = self.buffer.get_unchecked_mut(index);
-                    (*slot.value.get()).assume_init_drop();
+                    slot.value.with_mut(|value| (*value).assume_init_drop());
                 }
             }
         }
@@ -507,8 +511,8 @@ impl<T> Iterator for IntoIter<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let value = &mut self.value;
-        let head = *value.head.get_mut();
-        if value.head.get_mut() != value.tail.get_mut() {
+        let head = value.head.with_mut(|&mut head| head);
+        if value.head.with_mut(|&mut head| head) != value.tail.with_mut(|&mut tail| tail) {
             let index = head & (value.one_lap - 1);
             let lap = head & !(value.one_lap - 1);
             // SAFETY: We have mutable access to this, so we can read without
@@ -518,7 +522,7 @@ impl<T> Iterator for IntoIter<T> {
             let val = unsafe {
                 debug_assert!(index < value.buffer.len());
                 let slot = value.buffer.get_unchecked_mut(index);
-                slot.value.get().read().assume_init()
+                slot.value.with_mut(|value| value.read().assume_init())
             };
             let new = if index + 1 < value.capacity() {
                 // Same lap, incremented index.
@@ -529,7 +533,7 @@ impl<T> Iterator for IntoIter<T> {
                 // Set to `{ lap: lap.wrapping_add(1), index: 0 }`.
                 lap.wrapping_add(value.one_lap)
             };
-            *value.head.get_mut() = new;
+            value.head.with_mut(|head| *head = new);
             Some(val)
         } else {
             None

@@ -27,8 +27,21 @@ std = ["alloc", "crossbeam-utils/std"]
 # NOTE: Disabling both `std` *and* `alloc` features is not supported yet.
 alloc = []
 
+# Enable the use of loom for concurrency testing.
+#
+# NOTE: This feature is outside of the normal semver guarantees and minor or
+# patch versions of crossbeam may make breaking changes to them at any time.
+loom = ["loom-crate", "crossbeam-utils/loom"]
+
 [dependencies]
 crossbeam-utils = { version = "0.8.18", path = "../crossbeam-utils", default-features = false }
+
+# Enable the use of loom for concurrency testing.
+#
+# NOTE: This feature is outside of the normal semver guarantees and minor or
+# patch versions of crossbeam may make breaking changes to them at any time.
+[target.'cfg(crossbeam_loom)'.dependencies]
+loom-crate = { package = "loom", version = "0.7.1", optional = true }
 
 [dev-dependencies]
 rand = "0.8"

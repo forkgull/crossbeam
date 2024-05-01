@@ -1,12 +1,12 @@
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
 use core::fmt;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::panic::{RefUnwindSafe, UnwindSafe};
 use core::ptr;
-use core::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 
+use crate::primitive::cell::UnsafeCell;
+use crate::primitive::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 use crossbeam_utils::{Backoff, CachePadded};
 
 // Bits indicating the state of a slot:
@@ -26,6 +26,46 @@ const SHIFT: usize = 1;
 // Indicates that the block is not the last one.
 const HAS_NEXT: usize = 1;
 
+// Repeat an expression BLOCK_CAP times.
+#[cfg(crossbeam_loom)]
+macro_rules! repeat_31 {
+    ($x:expr) => {
+        [
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+            ($x),
+        ]
+    };
+}
+
 /// A slot in a block.
 struct Slot<T> {
     /// The value.
@@ -36,6 +76,7 @@ struct Slot<T> {
 }
 
 impl<T> Slot<T> {
+    #[cfg(not(crossbeam_loom))]
     const UNINIT: Self = Self {
         value: UnsafeCell::new(MaybeUninit::uninit()),
         state: AtomicUsize::new(0),
@@ -66,7 +107,13 @@ impl<T> Block<T> {
     fn new() -> Self {
         Self {
             next: AtomicPtr::new(ptr::null_mut()),
+            #[cfg(not(crossbeam_loom))]
             slots: [Slot::UNINIT; BLOCK_CAP],
+            #[cfg(crossbeam_loom)]
+            slots: repeat_31!(Slot {
+                value: UnsafeCell::new(MaybeUninit::uninit()),
+                state: AtomicUsize::new(0)
+            }),
         }
     }
 
@@ -162,7 +209,32 @@ impl<T> SegQueue<T> {
     ///
     /// let q = SegQueue::<i32>::new();
     /// ```
+    #[cfg(not(crossbeam_loom))]
     pub const fn new() -> Self {
+        Self {
+            head: CachePadded::new(Position {
+                block: AtomicPtr::new(ptr::null_mut()),
+                index: AtomicUsize::new(0),
+            }),
+            tail: CachePadded::new(Position {
+                block: AtomicPtr::new(ptr::null_mut()),
+                index: AtomicUsize::new(0),
+            }),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Creates a new unbounded queue.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_queue::SegQueue;
+    ///
+    /// let q = SegQueue::<i32>::new();
+    /// ```
+    #[cfg(crossbeam_loom)]
+    pub fn new() -> Self {
         Self {
             head: CachePadded::new(Position {
                 block: AtomicPtr::new(ptr::null_mut()),
@@ -254,7 +326,8 @@ impl<T> SegQueue<T> {
 
                     // Write the value into the slot.
                     let slot = (*block).slots.get_unchecked(offset);
-                    slot.value.get().write(MaybeUninit::new(value));
+                    slot.value
+                        .with_mut(|value_slot| value_slot.write(MaybeUninit::new(value)));
                     slot.state.fetch_or(WRITE, Ordering::Release);
 
                     return;
@@ -349,7 +422,7 @@ impl<T> SegQueue<T> {
                     // Read the value.
                     let slot = (*block).slots.get_unchecked(offset);
                     slot.wait_write();
-                    let value = slot.value.get().read().assume_init();
+                    let value = slot.value.with_mut(|value| value.read().assume_init());
 
                     // Destroy the block if we've reached the end, or if another thread wanted to
                     // destroy but couldn't because we were busy reading from the slot.
@@ -443,9 +516,9 @@ impl<T> SegQueue<T> {
 
 impl<T> Drop for SegQueue<T> {
     fn drop(&mut self) {
-        let mut head = *self.head.index.get_mut();
-        let mut tail = *self.tail.index.get_mut();
-        let mut block = *self.head.block.get_mut();
+        let mut head = self.head.index.with_mut(|&mut head| head);
+        let mut tail = self.tail.index.with_mut(|&mut tail| tail);
+        let mut block = self.head.block.with_mut(|&mut block| block);
 
         // Erase the lower bits.
         head &= !((1 << SHIFT) - 1);
@@ -459,10 +532,10 @@ impl<T> Drop for SegQueue<T> {
                 if offset < BLOCK_CAP {
                     // Drop the value in the slot.
                     let slot = (*block).slots.get_unchecked(offset);
-                    (*slot.value.get()).assume_init_drop();
+                    slot.value.with_mut(|value| (*value).assume_init_drop());
                 } else {
                     // Deallocate the block and move to the next one.
-                    let next = *(*block).next.get_mut();
+                    let next = (*block).next.with_mut(|&mut next| next);
                     drop(Box::from_raw(block));
                     block = next;
                 }
@@ -510,12 +583,12 @@ impl<T> Iterator for IntoIter<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let value = &mut self.value;
-        let head = *value.head.index.get_mut();
-        let tail = *value.tail.index.get_mut();
+        let head = value.head.index.with_mut(|&mut head| head);
+        let tail = value.tail.index.with_mut(|&mut tail| tail);
         if head >> SHIFT == tail >> SHIFT {
             None
         } else {
-            let block = *value.head.block.get_mut();
+            let block = value.head.block.with_mut(|&mut block| block);
             let offset = (head >> SHIFT) % LAP;
 
             // SAFETY: We have mutable access to this, so we can read without
@@ -524,7 +597,7 @@ impl<T> Iterator for IntoIter<T> {
             // and this is a non-empty queue.
             let item = unsafe {
                 let slot = (*block).slots.get_unchecked(offset);
-                slot.value.get().read().assume_init()
+                slot.value.with_mut(|value| value.read().assume_init())
             };
             if offset + 1 == BLOCK_CAP {
                 // Deallocate the block and move to the next one.
@@ -532,16 +605,25 @@ impl<T> Iterator for IntoIter<T> {
                 // from it this entire time. We can drop it b/c everything has
                 // been read out of it, so nothing is pointing to it anymore.
                 unsafe {
-                    let next = *(*block).next.get_mut();
+                    let next = (*block).next.with_mut(|&mut next| next);
                     drop(Box::from_raw(block));
-                    *value.head.block.get_mut() = next;
+                    value.head.block.with_mut(|block| *block = next);
                 }
                 // The last value in a block is empty, so skip it
-                *value.head.index.get_mut() = head.wrapping_add(2 << SHIFT);
+                value
+                    .head
+                    .index
+                    .with_mut(|head_slot| *head_slot = head.wrapping_add(2 << SHIFT));
                 // Double-check that we're pointing to the first item in a block.
-                debug_assert_eq!((*value.head.index.get_mut() >> SHIFT) % LAP, 0);
+                debug_assert_eq!(
+                    (value.head.index.with_mut(|&mut head| head) >> SHIFT) % LAP,
+                    0
+                );
             } else {
-                *value.head.index.get_mut() = head.wrapping_add(1 << SHIFT);
+                value
+                    .head
+                    .index
+                    .with_mut(|head_slot| *head_slot = head.wrapping_add(1 << SHIFT));
             }
             Some(item)
         }
